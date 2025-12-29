@@ -33,7 +33,8 @@ class CNN(nn.Module):
         self.bn8=nn.BatchNorm2d(256)
         self.bn9=nn.BatchNorm2d(128)
 
-    def forward(self, x,):
+    def extract_features(self, x):
+        # 提取分类器前的特征向量，用于相似度计算或其它下游任务
         h=x
         h=self.c1(h)
         h=F.leaky_relu(call_bn(self.bn1, h), negative_slope=0.01)
@@ -59,12 +60,18 @@ class CNN(nn.Module):
         h=F.leaky_relu(call_bn(self.bn8, h), negative_slope=0.01)
         h=self.c9(h)
         h=F.leaky_relu(call_bn(self.bn9, h), negative_slope=0.01)
-        h=F.avg_pool2d(h, kernel_size=h.data.shape[2])
+        h=F.avg_pool2d(h, kernel_size=h.shape[2])
 
         h = h.view(h.size(0), h.size(1))
-        logit=self.l_c1(h)
+        return h
+
+    def forward(self, x, return_feat=False):
+        # 默认只返回 logits；当 return_feat=True 时同时返回特征
+        feat = self.extract_features(x)
+        logit=self.l_c1(feat)
         if self.top_bn:
             logit=call_bn(self.bn_c1, logit)
+        if return_feat:
+            return logit, feat
         return logit
-
 
