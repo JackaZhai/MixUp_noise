@@ -14,6 +14,7 @@ import datetime
 import shutil
 
 from loss import loss_coteaching
+from mixup_clean import MixupCleanSelector
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--lr', type = float, default = 0.001)
@@ -31,6 +32,10 @@ parser.add_argument('--print_freq', type=int, default=50)
 parser.add_argument('--num_workers', type=int, default=4, help='how many subprocesses to use for data loading')
 parser.add_argument('--num_iter_per_epoch', type=int, default=400)
 parser.add_argument('--epoch_decay_start', type=int, default=80)
+parser.add_argument('--use_mixup', action='store_true', help='whether to use mixup-based selection')
+parser.add_argument('--mixup_times', type=int, default=20)
+parser.add_argument('--mixup_alpha', type=float, default=0.2)
+parser.add_argument('--mixup_threshold', type=float, default=0.7)
 
 args = parser.parse_args()
 
@@ -164,7 +169,7 @@ def accuracy(logit, target, topk=(1,)):
     return res
 
 # Train the Model
-def train(train_loader,epoch, model1, optimizer1, model2, optimizer2):
+def train(train_loader, epoch, model1, optimizer1, model2, optimizer2, selector, args):
     print 'Training %s...' % model_str
     pure_ratio_list=[]
     pure_ratio_1_list=[]
@@ -193,7 +198,40 @@ def train(train_loader,epoch, model1, optimizer1, model2, optimizer2):
         prec2, _ = accuracy(logits2, labels, topk=(1, 5))
         train_total2+=1
         train_correct2+=prec2
-        loss_1, loss_2, pure_ratio_1, pure_ratio_2 = loss_coteaching(logits1, logits2, labels, rate_schedule[epoch], ind, noise_or_not)
+        
+        if args.use_mixup:
+            # step 1: 筛选 clean mask
+            # 注意: select_clean 期望 inputs, labels 为 Tensor
+            # images, labels 已经是 GPU Variable/Tensor
+            clean_mask1, _ = selector.select_clean(images, labels, model1)
+            clean_mask2, _ = selector.select_clean(images, labels, model2)
+            
+            clean_mask1 = clean_mask1.to(logits1.device)
+            clean_mask2 = clean_mask2.to(logits1.device)
+            
+            # Exchange: Model1 用 clean_mask2 的样本训练
+            if clean_mask2.sum() > 0:
+                loss_1 = F.cross_entropy(logits1[clean_mask2], labels[clean_mask2])
+            else:
+                loss_1 = torch.tensor(0.0).to(logits1.device)
+
+            if clean_mask1.sum() > 0:
+                loss_2 = F.cross_entropy(logits2[clean_mask1], labels[clean_mask1])
+            else:
+                loss_2 = torch.tensor(0.0).to(logits2.device)
+                
+            # 计算 pure_ratio 用于 logging
+            # noise_or_not 是全局变量
+            with torch.no_grad():
+                sel_idx1 = ind[clean_mask1.cpu().numpy()]
+                sel_idx2 = ind[clean_mask2.cpu().numpy()]
+                
+                pure_ratio_1 = np.sum(noise_or_not[sel_idx1])/float(len(sel_idx1)) if len(sel_idx1)>0 else 0.0
+                pure_ratio_2 = np.sum(noise_or_not[sel_idx2])/float(len(sel_idx2)) if len(sel_idx2)>0 else 0.0
+
+        else:
+            loss_1, loss_2, pure_ratio_1, pure_ratio_2 = loss_coteaching(logits1, logits2, labels, rate_schedule[epoch], ind, noise_or_not)
+        
         pure_ratio_1_list.append(100*pure_ratio_1)
         pure_ratio_2_list.append(100*pure_ratio_2)
 
@@ -205,7 +243,7 @@ def train(train_loader,epoch, model1, optimizer1, model2, optimizer2):
         optimizer2.step()
         if (i+1) % args.print_freq == 0:
             print ('Epoch [%d/%d], Iter [%d/%d] Training Accuracy1: %.4F, Training Accuracy2: %.4f, Loss1: %.4f, Loss2: %.4f, Pure Ratio1: %.4f, Pure Ratio2 %.4f' 
-                  %(epoch+1, args.n_epoch, i+1, len(train_dataset)//batch_size, prec1, prec2, loss_1.data[0], loss_2.data[0], np.sum(pure_ratio_1_list)/len(pure_ratio_1_list), np.sum(pure_ratio_2_list)/len(pure_ratio_2_list)))
+                  %(epoch+1, args.n_epoch, i+1, len(train_dataset)//batch_size, prec1, prec2, loss_1.data[0] if isinstance(loss_1.data, torch.Tensor) and loss_1.data.dim()>0 else loss_1.item(), loss_2.data[0] if isinstance(loss_2.data, torch.Tensor) and loss_2.data.dim()>0 else loss_2.item(), np.sum(pure_ratio_1_list)/len(pure_ratio_1_list), np.sum(pure_ratio_2_list)/len(pure_ratio_2_list)))
 
     train_acc1=float(train_correct)/float(train_total)
     train_acc2=float(train_correct2)/float(train_total2)
@@ -266,6 +304,16 @@ def main():
     cnn2.cuda()
     print cnn2.parameters
     optimizer2 = torch.optim.Adam(cnn2.parameters(), lr=learning_rate)
+    
+    # Initialize Mixup Selector
+    selector = None
+    if args.use_mixup:
+        selector = MixupCleanSelector(
+            mixup_times=args.mixup_times,
+            alpha=args.mixup_alpha,
+            decision_threshold=args.mixup_threshold,
+            device='cuda' # or get from model
+        )
 
     mean_pure_ratio1=0
     mean_pure_ratio2=0
@@ -290,7 +338,7 @@ def main():
         adjust_learning_rate(optimizer1, epoch)
         cnn2.train()
         adjust_learning_rate(optimizer2, epoch)
-        train_acc1, train_acc2, pure_ratio_1_list, pure_ratio_2_list=train(train_loader, epoch, cnn1, optimizer1, cnn2, optimizer2)
+        train_acc1, train_acc2, pure_ratio_1_list, pure_ratio_2_list=train(train_loader, epoch, cnn1, optimizer1, cnn2, optimizer2, selector, args)
         # evaluate models
         test_acc1, test_acc2=evaluate(test_loader, cnn1, cnn2)
         # save results

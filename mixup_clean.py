@@ -264,57 +264,111 @@ class MixupCleanSelector(object):
 
         n_samples = inputs_cpu.size(0)
         clean_scores = torch.zeros(n_samples)
-        for i in range(n_samples):
-            y = int(labels_cpu[i])
-            pool = pool_by_class.get(y)
-            if pool is None or pool.numel() == 0:
-                # 同类参考池为空，无法评估，保持 0
+
+        # 优化：按批次处理 mixup 生成与推理
+        # 将输入分块处理，收集一批 mixup 样本后统一前向
+        
+        # 定义处理块大小，可根据内存调整
+        process_batch_size = self.batch_size
+
+        for start in range(0, n_samples, process_batch_size):
+            end = min(start + process_batch_size, n_samples)
+            
+            # 暂存当前批次的 mixup 数据和元数据
+            batch_mixups = []
+            batch_counts = []
+            batch_indices = []
+            
+            for i in range(start, end):
+                y = int(labels_cpu[i])
+                pool = pool_by_class.get(y)
+                if pool is None or pool.numel() == 0:
+                    continue
+                
+                # 处理 pool 包含自身的情况
+                if pool.numel() > 1:
+                    pool_clean = pool[pool != i]
+                    if pool_clean.numel() == 0:
+                        pool_clean = pool # 回退
+                else:
+                    pool_clean = pool
+                
+                # 4) 采样
+                if self.use_similarity_sampling:
+                    ref_idx = self._select_by_similarity(
+                        pool_clean,
+                        feature_bank,
+                        i,
+                        self.mixup_times,
+                        self.similarity_batch_size,
+                    )
+                    mixup_count = ref_idx.numel()
+                else:
+                    # _sample_indices 保证返回 mixup_times 个
+                    pick = self._sample_indices(pool_clean.numel(), self.mixup_times, pool_clean.device)
+                    ref_idx = pool_clean[pick]
+                    mixup_count = self.mixup_times
+
+                if mixup_count == 0:
+                    continue
+
+                x = inputs_cpu[i]
+                refs = inputs_cpu[ref_idx]
+
+                # 5) 生成 mixup
+                lam = self._sample_lambdas(mixup_count, x)
+                lam = lam.view(mixup_count, *([1] * x.dim()))
+                x_exp = x.unsqueeze(0).expand_as(refs)
+                mixup = lam * x_exp + (1.0 - lam) * refs # [M, C, H, W]
+
+                batch_mixups.append(mixup)
+                batch_counts.append(mixup_count)
+                batch_indices.append(i)
+
+            if not batch_mixups:
                 continue
-            if pool.numel() > 1:
-                # 避免把自己当参考（若被包含）
-                pool = pool[pool != i]
-                if pool.numel() == 0:
-                    pool = pool_by_class.get(y)
-            # 4) 从同类参考池中选择 M 个（随机 or 余弦相似度 TopM）
-            if self.use_similarity_sampling:
-                ref_idx = self._select_by_similarity(
-                    pool,
-                    feature_bank,
-                    i,
-                    self.mixup_times,
-                    self.similarity_batch_size,
-                )
-                mixup_count = ref_idx.numel()
-            else:
-                pick = self._sample_indices(pool.numel(), self.mixup_times, pool.device)
-                ref_idx = pool[pick]
-                mixup_count = self.mixup_times
-            x = inputs_cpu[i]
-            refs = inputs_cpu[ref_idx]
 
-            # 5) 生成 mixup 产物
-            if mixup_count == 0:
-                continue
-            lam = self._sample_lambdas(mixup_count, x)
-            lam = lam.view(mixup_count, *([1] * x.dim()))
-            x_exp = x.unsqueeze(0).expand_as(refs)
-            mixup = lam * x_exp + (1.0 - lam) * refs
+            # 拼合成大 Tensor 做批量推理 [Total_M, C, H, W]
+            big_input = torch.cat(batch_mixups, dim=0)
+            
+            # 分批送入 GPU 推理，防止 OOM
+            # 注意 inference batch size 是 self.batch_size
+            total_mixups = big_input.size(0)
+            all_logits = []
+            
+            for b_start in range(0, total_mixups, self.batch_size):
+                b_end = min(b_start + self.batch_size, total_mixups)
+                b_in = self._move(big_input[b_start:b_end], device)
+                logits_chunk = self._forward(model, b_in)
+                all_logits.append(logits_chunk.detach().cpu())
+            
+            big_logits = torch.cat(all_logits, dim=0)
 
-            # 6) 判别 mixup 是否 clean-like
-            mixup = self._move(mixup, device)
-            logits = self._forward(model, mixup)
-            if self.clean_metric == "confidence":
-                probs = F.softmax(logits, dim=1)
-                conf_mix = probs.max(dim=1).values
-                clean_like = conf_mix >= self.confidence_threshold
-            else:
-                targets = torch.full((mixup_count,), y, device=device, dtype=torch.long)
-                loss_mix = _cross_entropy_per_sample(logits, targets)
-                clean_like = loss_mix <= loss_thresholds.get(y, float("inf"))
+            # 拆分结果并计算得分
+            cursor = 0
+            for k in range(len(batch_indices)):
+                idx = batch_indices[k]
+                count = batch_counts[k]
+                y = int(labels_cpu[idx])
+                
+                sample_logits = big_logits[cursor : cursor + count]
+                cursor += count
+                
+                if self.clean_metric == "confidence":
+                    probs = F.softmax(sample_logits, dim=1)
+                    conf_mix = probs.max(dim=1).values
+                    clean_like = conf_mix >= self.confidence_threshold
+                else:
+                    # loss metric
+                    targets = torch.full((count,), y, dtype=torch.long) # CPU上计算metric即可
+                    # _cross_entropy_per_sample 期望 logits 和 targets 同 device
+                    # 这里把 sample_logits 放在 CPU, targets 也在 CPU
+                    loss_mix = _cross_entropy_per_sample(sample_logits, targets)
+                    clean_like = loss_mix <= loss_thresholds.get(y, float("inf"))
 
-            # 7) p(x) = clean-like 比例
-            score = clean_like.float().mean()
-            clean_scores[i] = score.detach().cpu().item()
+                # 7) p(x) = clean-like 比例
+                score = clean_like.float().mean()
+                clean_scores[idx] = score.item()
 
         # 8) 按阈值切分 clean / noisy
         clean_mask = clean_scores > self.decision_threshold
